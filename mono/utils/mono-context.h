@@ -118,7 +118,8 @@ typedef struct {
 	 __asm mov [eax+0x14], esp											\
 	 __asm mov [eax+0x18], esi											\
 	 __asm mov [eax+0x1c], edi											\
-	 __asm call $+5														\
+	 __asm call __mono_context_get_ip									\
+	 __asm __mono_context_get_ip:										\
 	 __asm pop dword ptr [eax+0x20]										\
 		 }																\
 	} while (0)
@@ -222,7 +223,8 @@ typedef struct {
 		"movq %%r13, 0x68(%0)\n"	\
 		"movq %%r14, 0x70(%0)\n"	\
 		"movq %%r15, 0x78(%0)\n"	\
-		"leaq (%%rip), %%rdx\n"	\
+		/* "leaq (%%rip), %%rdx\n" is not understood by icc */	\
+		".byte 0x48, 0x8d, 0x15, 0x00, 0x00, 0x00, 0x00\n" \
 		"movq %%rdx, 0x80(%0)\n"	\
 		: 	\
 		: "a" (&(ctx))	\

@@ -694,8 +694,8 @@ mono_gdb_render_native_backtraces (pid_t crashed_pid)
 		commands = fopen (template, "w");
 
 		fprintf (commands, "process attach --pid %ld\n", (long) crashed_pid);
-		fprintf (commands, "script lldb.debugger.HandleCommand (\"thread list\")\n");
-		fprintf (commands, "script lldb.debugger.HandleCommand (\"thread backtrace all\")\n");
+		fprintf (commands, "thread list\n");
+		fprintf (commands, "thread backtrace all\n");
 		fprintf (commands, "detach\n");
 		fprintf (commands, "quit\n");
 
@@ -728,7 +728,7 @@ mono_gdb_render_native_backtraces (pid_t crashed_pid)
 #if !defined (__MACH__)
 
 gboolean
-mono_thread_state_init_from_handle (MonoThreadUnwindState *tctx, MonoNativeThreadId thread_id, MonoNativeThreadHandle thread_handle)
+mono_thread_state_init_from_handle (MonoThreadUnwindState *tctx, MonoThreadInfo *info)
 {
 	g_error ("Posix systems don't support mono_thread_state_init_from_handle");
 	return FALSE;

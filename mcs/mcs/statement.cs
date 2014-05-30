@@ -688,11 +688,7 @@ namespace Mono.CSharp {
 				infinite = true;
 			}
 
-			base.Resolve (bc);
-
-			Iterator.Resolve (bc);
-
-			return true;
+			return base.Resolve (bc) && Iterator.Resolve (bc);
 		}
 
 		protected override bool DoFlowAnalysis (FlowAnalysisContext fc)
@@ -859,11 +855,11 @@ namespace Mono.CSharp {
 			var prev_loop = bc.EnclosingLoop;
 			var prev_los = bc.EnclosingLoopOrSwitch;
 			bc.EnclosingLoopOrSwitch = bc.EnclosingLoop = this;
-			Statement.Resolve (bc);
+			var ok = Statement.Resolve (bc);
 			bc.EnclosingLoopOrSwitch = prev_los;
 			bc.EnclosingLoop = prev_loop;
 
-			return true;
+			return ok;
 		}
 
 		//
@@ -3726,21 +3722,30 @@ namespace Mono.CSharp {
 			var label = value as LabeledStatement;
 			Block b = block;
 			if (label != null) {
-				do {
-					if (label.Block == b)
-						return label;
-					b = b.Parent;
-				} while (b != null);
+				if (IsLabelVisible (label, b))
+					return label;
+
 			} else {
 				List<LabeledStatement> list = (List<LabeledStatement>) value;
 				for (int i = 0; i < list.Count; ++i) {
 					label = list[i];
-					if (label.Block == b)
+					if (IsLabelVisible (label, b))
 						return label;
 				}
 			}
 
 			return null;
+		}
+
+		static bool IsLabelVisible (LabeledStatement label, Block b)
+		{
+			do {
+				if (label.Block == b)
+					return true;
+				b = b.Parent;
+			} while (b != null);
+
+			return false;
 		}
 
 		public ParameterInfo GetParameterInfo (Parameter p)
@@ -7024,12 +7029,12 @@ namespace Mono.CSharp {
 				}
 			}
 
-			base.Resolve (ec);
+			var ok = base.Resolve (ec);
 
 			if (vr != null)
 				vr.IsLockedByStatement = vr_locked;
 
-			return true;
+			return ok;
 		}
 
 		protected override void CloneTo (CloneContext clonectx, Statement t)
@@ -7590,8 +7595,7 @@ namespace Mono.CSharp {
 				Statement = new CollectionForeach (this, variable, expr);
 			}
 
-			base.Resolve (ec);
-			return true;
+			return base.Resolve (ec);
 		}
 
 		protected override void DoEmit (EmitContext ec)

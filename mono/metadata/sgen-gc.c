@@ -353,6 +353,8 @@ static long long time_major_fragment_creation = 0;
 int gc_debug_level = 0;
 FILE* gc_debug_file;
 
+static MonoGCFinalizerCallbacks fin_callbacks;
+
 /*
 void
 mono_gc_flush_info (void)
@@ -907,7 +909,7 @@ pin_objects_from_addresses (GCMemSection *section, void **start, void **end, voi
 	void *last_obj = NULL;
 	size_t last_obj_size = 0;
 	void *addr;
-	int idx;
+	size_t idx;
 	void **definitely_pinned = start;
 	ScanObjectFunc scan_func = ctx.scan_func;
 	SgenGrayQueue *queue = ctx.queue;
@@ -1356,12 +1358,12 @@ alloc_nursery (void)
 {
 	GCMemSection *section;
 	char *data;
-	int scan_starts;
-	int alloc_size;
+	size_t scan_starts;
+	size_t alloc_size;
 
 	if (nursery_section)
 		return;
-	SGEN_LOG (2, "Allocating nursery size: %lu", (unsigned long)sgen_nursery_size);
+	SGEN_LOG (2, "Allocating nursery size: %lu", (size_t)sgen_nursery_size);
 	/* later we will alloc a larger area for the nursery but only activate
 	 * what we need. The rest will be used as expansion if we have too many pinned
 	 * objects in the existing nursery.
@@ -1716,7 +1718,7 @@ finish_gray_stack (int generation, GrayQueue *queue)
 void
 sgen_check_section_scan_starts (GCMemSection *section)
 {
-	int i;
+	size_t i;
 	for (i = 0; i < section->num_scan_start; ++i) {
 		if (section->scan_starts [i]) {
 			guint size = safe_object_get_size ((MonoObject*) section->scan_starts [i]);
@@ -2083,12 +2085,12 @@ job_scan_los_mod_union_cardtable (WorkerData *worker_data, void *job_data_untype
 static void
 verify_scan_starts (char *start, char *end)
 {
-	int i;
+	size_t i;
 
 	for (i = 0; i < nursery_section->num_scan_start; ++i) {
 		char *addr = nursery_section->scan_starts [i];
 		if (addr > start && addr < end)
-			SGEN_LOG (1, "NFC-BAD SCAN START [%d] %p for obj [%p %p]", i, addr, start, end);
+			SGEN_LOG (1, "NFC-BAD SCAN START [%ld] %p for obj [%p %p]", i, addr, start, end);
 	}
 }
 
@@ -3352,6 +3354,13 @@ has_critical_finalizer (MonoObject *obj)
 	return mono_class_has_parent_fast (class, mono_defaults.critical_finalizer_object);
 }
 
+static gboolean
+is_finalization_aware (MonoObject *obj)
+{
+	MonoVTable *vt = ((MonoVTable*)LOAD_VTABLE (obj));
+	return (vt->gc_bits & SGEN_GC_BIT_FINALIZER_AWARE) == SGEN_GC_BIT_FINALIZER_AWARE;
+}
+
 void
 sgen_queue_finalization_entry (MonoObject *obj)
 {
@@ -3365,6 +3374,9 @@ sgen_queue_finalization_entry (MonoObject *obj)
 		entry->next = fin_ready_list;
 		fin_ready_list = entry;
 	}
+
+	if (fin_callbacks.object_queued_for_finalization && is_finalization_aware (obj))
+		fin_callbacks.object_queued_for_finalization (obj);
 
 #ifdef ENABLE_DTRACE
 	if (G_UNLIKELY (MONO_GC_FINALIZE_ENQUEUE_ENABLED ())) {
@@ -3839,7 +3851,7 @@ sgen_thread_detach (SgenThreadInfo *p)
 	 * the thread
 	 */
 	if (mono_domain_get ())
-		mono_thread_detach (mono_thread_current ());
+		mono_thread_detach_internal (mono_thread_internal_current ());
 }
 
 static void
@@ -4507,8 +4519,8 @@ mono_gc_base_init (void)
 	char **opts, **ptr;
 	char *major_collector_opt = NULL;
 	char *minor_collector_opt = NULL;
-	glong max_heap = 0;
-	glong soft_limit = 0;
+	size_t max_heap = 0;
+	size_t soft_limit = 0;
 	int num_workers;
 	int result;
 	int dummy;
@@ -4672,10 +4684,10 @@ mono_gc_base_init (void)
 			if (g_str_has_prefix (opt, "minor="))
 				continue;
 			if (g_str_has_prefix (opt, "max-heap-size=")) {
-				glong max_heap_candidate = 0;
+				size_t max_heap_candidate = 0;
 				opt = strchr (opt, '=') + 1;
 				if (*opt && mono_gc_parse_environment_string_extract_number (opt, &max_heap_candidate)) {
-					max_heap = (max_heap_candidate + mono_pagesize () - 1) & ~(glong)(mono_pagesize () - 1);
+					max_heap = (max_heap_candidate + mono_pagesize () - 1) & ~(size_t)(mono_pagesize () - 1);
 					if (max_heap != max_heap_candidate)
 						sgen_env_var_error (MONO_GC_PARAMS_NAME, "Rounding up.", "`max-heap-size` size must be a multiple of %d.", mono_pagesize ());
 				} else {
@@ -4739,7 +4751,7 @@ mono_gc_base_init (void)
 
 #ifdef USER_CONFIG
 			if (g_str_has_prefix (opt, "nursery-size=")) {
-				long val;
+				size_t val;
 				opt = strchr (opt, '=') + 1;
 				if (*opt && mono_gc_parse_environment_string_extract_number (opt, &val)) {
 #ifdef SGEN_ALIGN_NURSERY
@@ -4750,7 +4762,7 @@ mono_gc_base_init (void)
 
 					if (val < SGEN_MAX_NURSERY_WASTE) {
 						sgen_env_var_error (MONO_GC_PARAMS_NAME, "Using default value.",
-								"`nursery-size` must be at least %d bytes.\n", SGEN_MAX_NURSERY_WASTE);
+								"`nursery-size` must be at least %d bytes.", SGEN_MAX_NURSERY_WASTE);
 						continue;
 					}
 
@@ -5320,17 +5332,24 @@ sgen_get_remset (void)
 guint
 mono_gc_get_vtable_bits (MonoClass *class)
 {
+	guint res = 0;
 	/* FIXME move this to the bridge code */
-	if (!sgen_need_bridge_processing ())
-		return 0;
-	switch (sgen_bridge_class_kind (class)) {
-	case GC_BRIDGE_TRANSPARENT_BRIDGE_CLASS:
-	case GC_BRIDGE_OPAQUE_BRIDGE_CLASS:
-		return SGEN_GC_BIT_BRIDGE_OBJECT;
-	case GC_BRIDGE_OPAQUE_CLASS:
-		return SGEN_GC_BIT_BRIDGE_OPAQUE_OBJECT;
+	if (sgen_need_bridge_processing ()) {
+		switch (sgen_bridge_class_kind (class)) {
+		case GC_BRIDGE_TRANSPARENT_BRIDGE_CLASS:
+		case GC_BRIDGE_OPAQUE_BRIDGE_CLASS:
+			res = SGEN_GC_BIT_BRIDGE_OBJECT;
+			break;
+		case GC_BRIDGE_OPAQUE_CLASS:
+			res = SGEN_GC_BIT_BRIDGE_OPAQUE_OBJECT;
+			break;
+		}
 	}
-	return 0;
+	if (fin_callbacks.is_class_finalization_aware) {
+		if (fin_callbacks.is_class_finalization_aware (class))
+			res |= SGEN_GC_BIT_FINALIZER_AWARE;
+	}
+	return res;
 }
 
 void
@@ -5364,6 +5383,15 @@ sgen_timestamp (void)
 	SGEN_TV_DECLARE (timestamp);
 	SGEN_TV_GETTIME (timestamp);
 	return SGEN_TV_ELAPSED (sgen_init_timestamp, timestamp);
+}
+
+void
+mono_gc_register_finalizer_callbacks (MonoGCFinalizerCallbacks *callbacks)
+{
+	if (callbacks->version != MONO_GC_FINALIZER_EXTENSION_VERSION)
+		g_error ("Invalid finalizer callback version. Expected %d but got %d\n", MONO_GC_FINALIZER_EXTENSION_VERSION, callbacks->version);
+
+	fin_callbacks = *callbacks;
 }
 
 #endif /* HAVE_SGEN_GC */

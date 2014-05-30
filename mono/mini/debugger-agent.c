@@ -267,6 +267,9 @@ typedef struct {
 	 * to caller saved registers done by set_var ().
 	 */
 	MonoContext restore_ctx;
+
+	/* The currently unloading appdomain */
+	MonoDomain *domain_unloading;
 } DebuggerTlsData;
 
 typedef struct {
@@ -285,7 +288,7 @@ typedef struct {
 #define HEADER_LENGTH 11
 
 #define MAJOR_VERSION 2
-#define MINOR_VERSION 33
+#define MINOR_VERSION 34
 
 typedef enum {
 	CMD_SET_VM = 1,
@@ -353,7 +356,8 @@ typedef enum {
 	MOD_KIND_STEP = 10,
 	MOD_KIND_ASSEMBLY_ONLY = 11,
 	MOD_KIND_SOURCE_FILE_ONLY = 12,
-	MOD_KIND_TYPE_NAME_ONLY = 13
+	MOD_KIND_TYPE_NAME_ONLY = 13,
+	MOD_KIND_NONE = 14
 } ModifierKind;
 
 typedef enum {
@@ -416,7 +420,9 @@ typedef enum {
 	CMD_VM_SET_KEEPALIVE = 10,
 	CMD_VM_GET_TYPES_FOR_SOURCE_FILE = 11,
 	CMD_VM_GET_TYPES = 12,
-	CMD_VM_INVOKE_METHODS = 13
+	CMD_VM_INVOKE_METHODS = 13,
+	CMD_VM_START_BUFFERING = 14,
+	CMD_VM_STOP_BUFFERING = 15
 } CmdVM;
 
 typedef enum {
@@ -593,6 +599,16 @@ typedef struct {
 	void* dummy;
 } DebuggerProfiler;
 
+typedef struct {
+	guint8 *buf, *p, *end;
+} Buffer;
+
+typedef struct ReplyPacket {
+	int id;
+	int error;
+	Buffer *data;
+} ReplyPacket;
+
 #define DEBUG(level,s) do { if (G_UNLIKELY ((level) <= log_level)) { s; fflush (log_file); } } while (0)
 
 #ifdef HOST_WIN32
@@ -696,6 +712,13 @@ static GHashTable *domains;
 /* The number of times the runtime is suspended */
 static gint32 suspend_count;
 
+/* Whenever to buffer reply messages and send them together */
+static gboolean buffer_replies;
+
+/* Buffered reply packets */
+static ReplyPacket reply_packets [128];
+int nreply_packets;
+
 static void transport_init (void);
 static void transport_connect (const char *address);
 static gboolean transport_handshake (void);
@@ -712,6 +735,8 @@ static void thread_startup (MonoProfiler *prof, uintptr_t tid);
 static void thread_end (MonoProfiler *prof, uintptr_t tid);
 
 static void appdomain_load (MonoProfiler *prof, MonoDomain *domain, int result);
+
+static void appdomain_start_unload (MonoProfiler *prof, MonoDomain *domain);
 
 static void appdomain_unload (MonoProfiler *prof, MonoDomain *domain);
 
@@ -852,6 +877,8 @@ mono_debugger_agent_parse_options (char *options)
 	agent_config.defer = FALSE;
 	agent_config.address = NULL;
 
+	//agent_config.log_level = 10;
+
 	args = g_strsplit (options, ",", -1);
 	for (ptr = args; ptr && *ptr; ptr ++) {
 		char *arg = *ptr;
@@ -942,7 +969,7 @@ mono_debugger_agent_init (void)
 	mono_profiler_install ((MonoProfiler*)&debugger_profiler, runtime_shutdown);
 	mono_profiler_set_events (MONO_PROFILE_APPDOMAIN_EVENTS | MONO_PROFILE_THREADS | MONO_PROFILE_ASSEMBLY_EVENTS | MONO_PROFILE_JIT_COMPILATION | MONO_PROFILE_METHOD_EVENTS);
 	mono_profiler_install_runtime_initialized (runtime_initialized);
-	mono_profiler_install_appdomain (NULL, appdomain_load, NULL, appdomain_unload);
+	mono_profiler_install_appdomain (NULL, appdomain_load, appdomain_start_unload, appdomain_unload);
 	mono_profiler_install_thread (thread_startup, thread_end);
 	mono_profiler_install_assembly (NULL, assembly_load, assembly_unload, NULL);
 	mono_profiler_install_jit_end (jit_end);
@@ -1653,16 +1680,18 @@ decode_string (guint8 *buf, guint8 **endbuf, guint8 *limit)
  * Functions to encode protocol data
  */
 
-typedef struct {
-	guint8 *buf, *p, *end;
-} Buffer;
-
 static inline void
 buffer_init (Buffer *buf, int size)
 {
 	buf->buf = g_malloc (size);
 	buf->p = buf->buf;
 	buf->end = buf->buf + size;
+}
+
+static inline int
+buffer_len (Buffer *buf)
+{
+	return buf->p - buf->buf;
 }
 
 static inline void
@@ -1742,6 +1771,12 @@ buffer_add_string (Buffer *buf, const char *str)
 }
 
 static inline void
+buffer_add_buffer (Buffer *buf, Buffer *data)
+{
+	buffer_add_data (buf, data->buf, buffer_len (data));
+}
+
+static inline void
 buffer_free (Buffer *buf)
 {
 	g_free (buf->buf);
@@ -1773,26 +1808,71 @@ send_packet (int command_set, int command, Buffer *data)
 }
 
 static gboolean
-send_reply_packet (int id, int error, Buffer *data)
+send_reply_packets (int npackets, ReplyPacket *packets)
 {
 	Buffer buf;
-	int len;
+	int i, len;
 	gboolean res;
-	
-	len = data->p - data->buf + 11;
-	buffer_init (&buf, len);
-	buffer_add_int (&buf, len);
-	buffer_add_int (&buf, id);
-	buffer_add_byte (&buf, 0x80); /* flags */
-	buffer_add_byte (&buf, (error >> 8) & 0xff);
-	buffer_add_byte (&buf, error);
-	memcpy (buf.buf + 11, data->buf, data->p - data->buf);
 
+	len = 0;
+	for (i = 0; i < npackets; ++i)
+		len += buffer_len (packets [i].data) + 11;
+	buffer_init (&buf, len);
+	for (i = 0; i < npackets; ++i) {
+		buffer_add_int (&buf, buffer_len (packets [i].data) + 11);
+		buffer_add_int (&buf, packets [i].id);
+		buffer_add_byte (&buf, 0x80); /* flags */
+		buffer_add_byte (&buf, (packets [i].error >> 8) & 0xff);
+		buffer_add_byte (&buf, packets [i].error);
+		buffer_add_buffer (&buf, packets [i].data);
+	}
 	res = transport_send (buf.buf, len);
 
 	buffer_free (&buf);
 
 	return res;
+}
+
+static gboolean
+send_reply_packet (int id, int error, Buffer *data)
+{
+	ReplyPacket packet;
+
+	memset (&packet, 0, sizeof (ReplyPacket));
+	packet.id = id;
+	packet.error = error;
+	packet.data = data;
+
+	return send_reply_packets (1, &packet);
+}
+
+static void
+send_buffered_reply_packets (void)
+{
+	int i;
+
+	send_reply_packets (nreply_packets, reply_packets);
+	for (i = 0; i < nreply_packets; ++i)
+		buffer_free (reply_packets [i].data);
+	DEBUG (1, fprintf (log_file, "[dbg] Sent %d buffered reply packets [at=%lx].\n", nreply_packets, (long)mono_100ns_ticks () / 10000));
+	nreply_packets = 0;
+}
+
+static void
+buffer_reply_packet (int id, int error, Buffer *data)
+{
+	ReplyPacket *p;
+
+	if (nreply_packets == 128)
+		send_buffered_reply_packets ();
+
+	p = &reply_packets [nreply_packets];
+	p->id = id;
+	p->error = error;
+	p->data = g_new0 (Buffer, 1);
+	buffer_init (p->data, buffer_len (data));
+	buffer_add_buffer (p->data, data);
+	nreply_packets ++;
 }
 
 /*
@@ -2219,10 +2299,13 @@ decode_ptr_id (guint8 *buf, guint8 **endbuf, guint8 *limit, IdType type, MonoDom
 	return res->data.val;
 }
 
-static inline void
+static inline int
 buffer_add_ptr_id (Buffer *buf, MonoDomain *domain, IdType type, gpointer val)
 {
-	buffer_add_id (buf, get_id (domain, type, val));
+	int id = get_id (domain, type, val);
+
+	buffer_add_id (buf, id);
+	return id;
 }
 
 static inline MonoClass*
@@ -2319,7 +2402,11 @@ buffer_add_methodid (Buffer *buf, MonoDomain *domain, MonoMethod *method)
 static inline void
 buffer_add_assemblyid (Buffer *buf, MonoDomain *domain, MonoAssembly *assembly)
 {
-	buffer_add_ptr_id (buf, domain, ID_ASSEMBLY, assembly);
+	int id;
+
+	id = buffer_add_ptr_id (buf, domain, ID_ASSEMBLY, assembly);
+	if (G_UNLIKELY (log_level >= 2) && assembly)
+		DEBUG(2, fprintf (log_file, "[dbg]   send assembly [%s][%s][%d]\n", assembly->aname.name, domain->friendly_name, id));
 }
 
 static inline void
@@ -2655,7 +2742,7 @@ notify_thread (gpointer key, gpointer value, gpointer user_data)
 
 			thread_interrupt (tls, info, NULL, ji);
 
-			mono_thread_info_resume (mono_thread_info_get_tid (info));
+			mono_thread_info_finish_suspend_and_resume (info);
 		}
 	} else {
 		res = mono_thread_kill (thread, mono_thread_get_abort_signal ());
@@ -3672,9 +3759,19 @@ process_event (EventKind event, gpointer arg, gint32 il_offset, MonoContext *ctx
 			buffer_add_methodid (&buf, domain, arg);
 			break;
 		case EVENT_KIND_ASSEMBLY_LOAD:
-		case EVENT_KIND_ASSEMBLY_UNLOAD:
 			buffer_add_assemblyid (&buf, domain, arg);
 			break;
+		case EVENT_KIND_ASSEMBLY_UNLOAD: {
+			DebuggerTlsData *tls;
+
+			/* The domain the assembly belonged to is not equal to the current domain */
+			tls = mono_native_tls_get_value (debugger_tls_id);
+			g_assert (tls);
+			g_assert (tls->domain_unloading);
+
+			buffer_add_assemblyid (&buf, tls->domain_unloading, arg);
+			break;
+		}
 		case EVENT_KIND_TYPE_LOAD:
 			buffer_add_typeid (&buf, domain, arg);
 			break;
@@ -3912,8 +4009,28 @@ appdomain_load (MonoProfiler *prof, MonoDomain *domain, int result)
 }
 
 static void
+appdomain_start_unload (MonoProfiler *prof, MonoDomain *domain)
+{
+	DebuggerTlsData *tls;
+
+	/*
+	 * Remember the currently unloading appdomain as it is needed to generate
+	 * proper ids for unloading assemblies.
+	 */
+	tls = mono_native_tls_get_value (debugger_tls_id);
+	g_assert (tls);
+	tls->domain_unloading = domain;
+}
+
+static void
 appdomain_unload (MonoProfiler *prof, MonoDomain *domain)
 {
+	DebuggerTlsData *tls;
+
+	tls = mono_native_tls_get_value (debugger_tls_id);
+	g_assert (tls);
+	tls->domain_unloading = NULL;
+
 	clear_breakpoints_for_domain (domain);
 	
 	mono_loader_lock ();
@@ -4210,7 +4327,7 @@ insert_breakpoint (MonoSeqPointInfo *seq_points, MonoDomain *domain, MonoJitInfo
 #endif
 	}
 
-	DEBUG(1, fprintf (log_file, "[dbg] Inserted breakpoint at %s:0x%x.\n", mono_method_full_name (jinfo_get_method (ji), TRUE), (int)sp->il_offset));	
+	DEBUG(1, fprintf (log_file, "[dbg] Inserted breakpoint at %s:0x%x [%p](%d).\n", mono_method_full_name (jinfo_get_method (ji), TRUE), (int)sp->il_offset, inst->ip, count));
 }
 
 static void
@@ -4230,6 +4347,7 @@ remove_breakpoint (BreakpointInstance *inst)
 
 	if (count == 1 && inst->native_offset != SEQ_POINT_NATIVE_OFFSET_DEAD_CODE) {
 		mono_arch_clear_breakpoint (ji, ip);
+		DEBUG(1, fprintf (log_file, "[dbg] Clear breakpoint at %s [%p].\n", mono_method_full_name (jinfo_get_method (ji), TRUE), ip));
 	}
 #else
 	NOT_IMPLEMENTED;
@@ -5296,6 +5414,25 @@ ss_destroy (SingleStepReq *req)
 	ss_req = NULL;
 }
 
+static void
+ss_clear_for_assembly (SingleStepReq *req, MonoAssembly *assembly)
+{
+	GSList *l;
+	gboolean found = TRUE;
+
+	while (found) {
+		found = FALSE;
+		for (l = ss_req->bps; l; l = l->next) {
+			if (breakpoint_matches_assembly (l->data, assembly)) {
+				clear_breakpoint (l->data);
+				ss_req->bps = g_slist_delete_link (ss_req->bps, l);
+				found = TRUE;
+				break;
+			}
+		}
+	}
+}
+
 /*
  * Called from metadata by the icall for System.Diagnostics.Debugger:Log ().
  */
@@ -6195,28 +6332,47 @@ clear_event_request (int req_id, int etype)
 	mono_loader_unlock ();
 }
 
-static gboolean
-event_req_matches_assembly (EventRequest *req, MonoAssembly *assembly)
+static void
+clear_assembly_from_modifier (EventRequest *req, Modifier *m, MonoAssembly *assembly)
 {
-	if (req->event_kind == EVENT_KIND_BREAKPOINT)
-		return breakpoint_matches_assembly (req->info, assembly);
-	else {
-		int i, j;
+	int i;
 
-		for (i = 0; i < req->nmodifiers; ++i) {
-			Modifier *m = &req->modifiers [i];
+	if (m->kind == MOD_KIND_EXCEPTION_ONLY && m->data.exc_class && m->data.exc_class->image->assembly == assembly)
+		m->kind = MOD_KIND_NONE;
+	if (m->kind == MOD_KIND_ASSEMBLY_ONLY && m->data.assemblies) {
+		int count = 0, match_count = 0, pos;
+		MonoAssembly **newassemblies;
 
-			if (m->kind == MOD_KIND_EXCEPTION_ONLY && m->data.exc_class && m->data.exc_class->image->assembly == assembly)
-				return TRUE;
-			if (m->kind == MOD_KIND_ASSEMBLY_ONLY && m->data.assemblies) {
-				for (j = 0; m->data.assemblies [j]; ++j)
-					if (m->data.assemblies [j] == assembly)
-						return TRUE;
-			}
+		for (i = 0; m->data.assemblies [i]; ++i) {
+			count ++;
+			if (m->data.assemblies [i] == assembly)
+				match_count ++;
+		}
+
+		if (match_count) {
+			newassemblies = g_new0 (MonoAssembly*, count - match_count);
+
+			pos = 0;
+			for (i = 0; i < count; ++i)
+				if (m->data.assemblies [i] != assembly)
+					newassemblies [pos ++] = m->data.assemblies [i];
+			g_assert (pos == count - match_count);
+			g_free (m->data.assemblies);
+			m->data.assemblies = newassemblies;
 		}
 	}
+}
 
-	return FALSE;
+static void
+clear_assembly_from_modifiers (EventRequest *req, MonoAssembly *assembly)
+{
+	int i;
+
+	for (i = 0; i < req->nmodifiers; ++i) {
+		Modifier *m = &req->modifiers [i];
+
+		clear_assembly_from_modifier (req, m, assembly);
+	}
 }
 
 /*
@@ -6237,11 +6393,16 @@ clear_event_requests_for_assembly (MonoAssembly *assembly)
 		for (i = 0; i < event_requests->len; ++i) {
 			EventRequest *req = g_ptr_array_index (event_requests, i);
 
-			if (event_req_matches_assembly (req, assembly)) {
+			clear_assembly_from_modifiers (req, assembly);
+
+			if (req->event_kind == EVENT_KIND_BREAKPOINT && breakpoint_matches_assembly (req->info, assembly)) {
 				clear_event_request (req->id, req->event_kind);
 				found = TRUE;
 				break;
 			}
+
+			if (req->event_kind == EVENT_KIND_STEP)
+				ss_clear_for_assembly (req->info, assembly);
 		}
 	}
 	mono_loader_unlock ();
@@ -7019,7 +7180,10 @@ vm_commands (int command, int id, guint8 *p, guint8 *end, Buffer *buf)
 		g_ptr_array_free (res_domains, TRUE);
 		break;
 	}
-
+	case CMD_VM_START_BUFFERING:
+	case CMD_VM_STOP_BUFFERING:
+		/* Handled in the main loop */
+		break;
 	default:
 		return ERR_NOT_IMPLEMENTED;
 	}
@@ -9329,7 +9493,7 @@ debugger_thread (void *arg)
 				cmd_str = cmd_num;
 			}
 			
-			DEBUG (1, fprintf (log_file, "[dbg] Command %s(%s) [%d].\n", command_set_to_string (command_set), cmd_str, id));
+			DEBUG (1, fprintf (log_file, "[dbg] Command %s(%s) [%d][at=%lx].\n", command_set_to_string (command_set), cmd_str, id, (long)mono_100ns_ticks () / 10000));
 		}
 
 		data = g_malloc (len - HEADER_LENGTH);
@@ -9398,8 +9562,23 @@ debugger_thread (void *arg)
 			err = ERR_NOT_IMPLEMENTED;
 		}		
 
-		if (!no_reply)
-			send_reply_packet (id, err, &buf);
+		if (command_set == CMD_SET_VM && command == CMD_VM_START_BUFFERING) {
+			buffer_replies = TRUE;
+		}
+
+		if (!no_reply) {
+			if (buffer_replies) {
+				buffer_reply_packet (id, err, &buf);
+			} else {
+				send_reply_packet (id, err, &buf);
+				//DEBUG (1, fprintf (log_file, "[dbg] Sent reply to %d [at=%lx].\n", id, (long)mono_100ns_ticks () / 10000));
+			}
+		}
+
+		if (!err && command_set == CMD_SET_VM && command == CMD_VM_STOP_BUFFERING) {
+			send_buffered_reply_packets ();
+			buffer_replies = FALSE;
+		}
 
 		g_free (data);
 		buffer_free (&buf);
