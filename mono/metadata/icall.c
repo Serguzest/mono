@@ -75,6 +75,7 @@
 #include <mono/metadata/mono-ptr-array.h>
 #include <mono/metadata/verify-internals.h>
 #include <mono/metadata/runtime.h>
+#include <mono/metadata/file-mmap.h>
 #include <mono/io-layer/io-layer.h>
 #include <mono/utils/strtod.h>
 #include <mono/utils/monobitset.h>
@@ -126,17 +127,12 @@ mono_double_ParseImpl (char *ptr, double *result)
 
 	MONO_ARCH_SAVE_REGS;
 
-#ifdef __arm__
-	if (*ptr)
-		*result = strtod (ptr, &endptr);
-#else
 	if (*ptr){
 		/* mono_strtod () is not thread-safe */
 		EnterCriticalSection (&mono_strtod_mutex);
 		*result = mono_strtod (ptr, &endptr);
 		LeaveCriticalSection (&mono_strtod_mutex);
 	}
-#endif
 
 	if (!*ptr || (endptr && *endptr))
 		return FALSE;
@@ -6468,12 +6464,11 @@ ves_icall_System_Environment_GetEnvironmentVariableNames (void)
 ICALL_EXPORT void
 ves_icall_System_Environment_InternalSetEnvironmentVariable (MonoString *name, MonoString *value)
 {
-	MonoError error;
 #ifdef HOST_WIN32
-
 	gunichar2 *utf16_name, *utf16_value;
 #else
 	gchar *utf8_name, *utf8_value;
+	MonoError error;
 #endif
 
 	MONO_ARCH_SAVE_REGS;
@@ -6731,7 +6726,7 @@ ICALL_EXPORT void
 ves_icall_System_Environment_BroadcastSettingChange (void)
 {
 #ifdef HOST_WIN32
-	SendMessageTimeout (HWND_BROADCAST, WM_SETTINGCHANGE, NULL, L"Environment", SMTO_ABORTIFHUNG, 2000, 0);
+	SendMessageTimeout (HWND_BROADCAST, WM_SETTINGCHANGE, (WPARAM)NULL, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 2000, 0);
 #endif
 }
 

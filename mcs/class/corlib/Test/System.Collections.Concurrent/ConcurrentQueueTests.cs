@@ -30,6 +30,7 @@ using System.Collections.Generic;
 using System.Collections.Concurrent;
 
 using NUnit.Framework;
+using MonoTests.System.Threading.Tasks;
 
 namespace MonoTests.System.Collections.Concurrent
 {
@@ -113,6 +114,34 @@ namespace MonoTests.System.Collections.Concurrent
 			});*/
 			
 			CollectionStressTestHelper.RemoveStressTest (new ConcurrentQueue<int> (), CheckOrderingType.InOrder);
+		}
+		
+		[Test]
+		public void StressTryPeekTestCase ()
+		{
+			ParallelTestHelper.Repeat (delegate {
+				var queue = new ConcurrentQueue<object> ();
+				queue.Enqueue (new object());
+				
+				const int threads = 10;
+				int threadCounter = 0;
+				bool success = true;
+				
+				ParallelTestHelper.ParallelStressTest (queue, (q) => {
+					int threadId = Interlocked.Increment (ref threadCounter);
+					object temp;
+					if (threadId < threads)
+					{
+						while (queue.TryPeek (out temp))
+							if (temp == null)
+								success = false;
+					} else {
+						queue.TryDequeue (out temp);
+					}
+				}, threads);
+				
+				Assert.IsTrue (success, "TryPeek returned unexpected null value.");
+			}, 10);
 		}
 		
 		[Test]
@@ -215,13 +244,15 @@ namespace MonoTests.System.Collections.Concurrent
 		{
 			queue.CopyTo (new int[3], 0);
 		}
-		
+
 		static WeakReference CreateWeakReference (object obj)
 		{
 			return new WeakReference (obj);
 		}
-		
+
 		[Test]
+		// This depends on precise stack scanning
+		[Category ("NotWorking")]
 		public void TryDequeueReferenceTest ()
 		{
 			var obj = new Object ();
